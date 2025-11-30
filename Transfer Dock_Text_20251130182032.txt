@@ -1,0 +1,747 @@
+scheduler_habit_tracker.html:
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planner & Habit Tracker</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js CDN for the Line Graph -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <style>
+        /* Mengatur font default dan transisi untuk dark mode */
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .dark body {
+            background-color: #1a202c;
+            color: #e2e8f0;
+        }
+        .scroll-container {
+            /* Custom scrollbar for better aesthetics */
+            scrollbar-width: thin;
+            scrollbar-color: #4f46e5 #e2e8f0;
+        }
+        .scroll-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .scroll-container::-webkit-scrollbar-thumb {
+            background-color: #4f46e5;
+            border-radius: 10px;
+        }
+        .scroll-container::-webkit-scrollbar-track {
+            background-color: #e2e8f0;
+        }
+        /* Dark mode scrollbar */
+        .dark .scroll-container {
+            scrollbar-color: #8b5cf6 #2d3748;
+        }
+        .dark .scroll-container::-webkit-scrollbar-thumb {
+            background-color: #8b5cf6;
+        }
+        .dark .scroll-container::-webkit-scrollbar-track {
+            background-color: #2d3748;
+        }
+        /* Custom styles for the hourly planner */
+        .hour-slot {
+            display: grid;
+            grid-template-columns: 80px 1fr;
+            gap: 1rem;
+            align-items: center;
+        }
+    </style>
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import {
+            getAuth,
+            signInAnonymously,
+            signInWithCustomToken,
+            onAuthStateChanged
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import {
+            getFirestore,
+            doc,
+            setDoc,
+            collection,
+            query,
+            onSnapshot,
+            serverTimestamp,
+            deleteDoc,
+            updateDoc,
+            runTransaction,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Menonaktifkan log level yang terlalu verbose
+        setLogLevel('error');
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        let globalTasks = [];
+        let taskListenerUnsubscribe = null;
+        let currentView = 'daily'; // Default view
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+        window.onload = async () => {
+            console.log("Memulai inisialisasi Firebase...");
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Autentikasi pengguna
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        console.log("Pengguna terautentikasi:", userId);
+                        // Tampilkan ID Pengguna di UI
+                        document.getElementById('user-id-display').textContent = `ID Pengguna: ${userId}`;
+                        // Setelah autentikasi siap, muat data
+                        loadTasks();
+                    } else {
+                        // Jika token tersedia, gunakan; jika tidak, masuk secara anonim
+                        if (initialAuthToken) {
+                             await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+
+                // Inisialisasi logika mode gelap/terang
+                initTheme();
+
+                // Set up event listeners for navigation
+                document.querySelectorAll('.nav-button').forEach(button => {
+                    button.addEventListener('click', () => {
+                        currentView = button.dataset.view;
+                        renderUI(currentView);
+                    });
+                });
+
+                // Set up event listener for the main form submission
+                document.getElementById('task-form').addEventListener('submit', handleAddTask);
+                document.getElementById('edit-task-form').addEventListener('submit', handleSaveEditTask);
+                document.getElementById('delete-task-btn').addEventListener('click', handleDeleteTask);
+
+            } catch (error) {
+                console.error("Gagal menginisialisasi Firebase atau autentikasi:", error);
+                document.getElementById('task-list-container').innerHTML = `<p class="text-red-500 p-4">Error: Gagal memuat data. Periksa konsol untuk detail.</p>`;
+            }
+        };
+
+        // --- FIREBASE DATA FUNCTIONS ---
+        const TASKS_COLLECTION = (userId) => `artifacts/${appId}/users/${userId}/habits_and_tasks`;
+
+        // Load tasks using onSnapshot for real-time updates
+        function loadTasks() {
+            if (!isAuthReady || !userId) return;
+
+            // Stop previous listener if exists
+            if (taskListenerUnsubscribe) {
+                taskListenerUnsubscribe();
+            }
+
+            const tasksRef = collection(db, TASKS_COLLECTION(userId));
+            const q = query(tasksRef);
+
+            taskListenerUnsubscribe = onSnapshot(q, (snapshot) => {
+                globalTasks = [];
+                snapshot.forEach((doc) => {
+                    // Pastikan field completions ada
+                    const data = doc.data();
+                    data.completions = data.completions || {};
+                    globalTasks.push({ id: doc.id, ...data });
+                });
+                console.log("Data tugas dimuat:", globalTasks.length, "tugas.");
+                // Render ulang UI setiap kali data berubah
+                renderUI(currentView);
+            }, (error) => {
+                console.error("Gagal mendengarkan pembaruan Firestore:", error);
+            });
+        }
+
+        async function handleAddTask(e) {
+            e.preventDefault();
+            if (!isAuthReady || !userId) return;
+
+            const name = document.getElementById('task-name').value.trim();
+            const frequency = document.getElementById('task-frequency').value;
+            const schedule = document.getElementById('task-schedule').value;
+            const type = document.getElementById('task-type').value;
+
+            if (!name) return;
+
+            const tasksRef = collection(db, TASKS_COLLECTION(userId));
+            try {
+                const newTask = {
+                    name,
+                    frequency,
+                    schedule: schedule || null,
+                    type, // 'task' or 'habit'
+                    completions: {}, // Used for habit tracking/chart
+                    isCompleted: false, // Used for one-time tasks
+                    createdAt: serverTimestamp()
+                };
+
+                await setDoc(doc(tasksRef), newTask);
+                document.getElementById('task-name').value = ''; // Clear form
+            } catch (error) {
+                console.error("Gagal menambahkan tugas:", error);
+            }
+        }
+
+        async function handleToggleCompletion(taskId, type, isCurrentlyCompleted) {
+            if (!isAuthReady || !userId) return;
+
+            const taskRef = doc(db, TASKS_COLLECTION(userId), taskId);
+            const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
+            try {
+                if (type === 'task') {
+                    // Toggle isCompleted for one-time tasks
+                    await updateDoc(taskRef, {
+                        isCompleted: !isCurrentlyCompleted
+                    });
+                } else if (type === 'habit') {
+                    // Toggle completion status for today in the 'completions' map
+                    await runTransaction(db, async (transaction) => {
+                        const taskDoc = await transaction.get(taskRef);
+                        if (!taskDoc.exists()) {
+                            throw "Dokumen tidak ada!";
+                        }
+                        const currentCompletions = taskDoc.data().completions || {};
+
+                        // Toggle status: set to true if currently false/undefined, or remove if currently true
+                        const newStatus = !currentCompletions[today];
+                        const newCompletions = { ...currentCompletions };
+
+                        if (newStatus) {
+                            newCompletions[today] = true;
+                        } else {
+                            delete newCompletions[today];
+                        }
+
+                        transaction.update(taskRef, { completions: newCompletions });
+                    });
+                }
+            } catch (error) {
+                console.error("Gagal mengubah status penyelesaian:", error);
+            }
+        }
+
+        let taskToEdit = null;
+
+        function handleOpenEditModal(task) {
+            taskToEdit = task;
+            document.getElementById('edit-task-id').value = task.id;
+            document.getElementById('edit-task-name').value = task.name;
+            document.getElementById('edit-task-frequency').value = task.frequency;
+            document.getElementById('edit-task-schedule').value = task.schedule || '';
+            document.getElementById('edit-task-type').value = task.type;
+
+            document.getElementById('edit-modal').classList.remove('hidden');
+        }
+
+        function handleCloseEditModal() {
+            document.getElementById('edit-modal').classList.add('hidden');
+            taskToEdit = null;
+        }
+
+        async function handleSaveEditTask(e) {
+            e.preventDefault();
+            if (!isAuthReady || !userId || !taskToEdit) return;
+
+            const taskId = document.getElementById('edit-task-id').value;
+            const name = document.getElementById('edit-task-name').value.trim();
+            const frequency = document.getElementById('edit-task-frequency').value;
+            const schedule = document.getElementById('edit-task-schedule').value;
+            const type = document.getElementById('edit-task-type').value;
+
+            if (!name) return;
+
+            const taskRef = doc(db, TASKS_COLLECTION(userId), taskId);
+
+            try {
+                await updateDoc(taskRef, {
+                    name,
+                    frequency,
+                    schedule: schedule || null,
+                    type,
+                });
+                handleCloseEditModal();
+            } catch (error) {
+                console.error("Gagal menyimpan tugas yang diedit:", error);
+            }
+        }
+
+        async function handleDeleteTask() {
+            if (!isAuthReady || !userId || !taskToEdit) return;
+
+            const taskId = taskToEdit.id;
+            const taskRef = doc(db, TASKS_COLLECTION(userId), taskId);
+
+            try {
+                await deleteDoc(taskRef);
+                handleCloseEditModal();
+            } catch (error) {
+                console.error("Gagal menghapus tugas:", error);
+            }
+        }
+
+        window.handleToggleCompletion = handleToggleCompletion; // Export to global scope
+        window.handleOpenEditModal = handleOpenEditModal;
+        window.handleCloseEditModal = handleCloseEditModal;
+
+        // --- UI RENDERING FUNCTIONS ---
+
+        function renderUI(view) {
+            const container = document.getElementById('task-list-container');
+            container.innerHTML = '';
+            document.getElementById('hourly-planner-container').classList.add('hidden');
+            document.getElementById('progress-chart-container').classList.add('hidden');
+            document.getElementById('task-list-view').classList.remove('hidden');
+
+            // Reset active button state
+            document.querySelectorAll('.nav-button').forEach(btn => {
+                btn.classList.remove('bg-indigo-600', 'text-white', 'dark:bg-purple-600');
+                btn.classList.add('bg-gray-100', 'text-gray-700', 'dark:bg-gray-700', 'dark:text-gray-300');
+            });
+            // Set active button
+            const activeButton = document.querySelector(`.nav-button[data-view="${view}"]`);
+            if (activeButton) {
+                activeButton.classList.add('bg-indigo-600', 'text-white', 'dark:bg-purple-600');
+                activeButton.classList.remove('bg-gray-100', 'text-gray-700', 'dark:bg-gray-700', 'dark:text-gray-300');
+            }
+
+            // Tentukan judul dan filter tugas
+            let filteredTasks = [];
+            let title = '';
+
+            switch (view) {
+                case 'daily':
+                    title = 'Jadwal Harian & Habit';
+                    filteredTasks = globalTasks.filter(t => t.frequency === 'daily' || t.frequency === 'one-time');
+                    break;
+                case 'weekly':
+                    title = 'Rencana Mingguan';
+                    filteredTasks = globalTasks.filter(t => t.frequency === 'weekly' || t.frequency === 'one-time');
+                    break;
+                case 'monthly':
+                    title = 'Goals Bulanan';
+                    filteredTasks = globalTasks.filter(t => t.frequency === 'monthly' || t.frequency === 'one-time');
+                    break;
+                case 'hourly':
+                    title = 'Planning Time (Per Jam)';
+                    // Tampilkan hanya tugas harian atau tugas dengan jadwal per jam
+                    const hourlyTasks = globalTasks
+                        .filter(t => t.schedule && (t.frequency === 'daily' || t.frequency === 'one-time'))
+                        .sort((a, b) => (a.schedule || '').localeCompare(b.schedule || ''));
+                    document.getElementById('task-list-view').classList.add('hidden');
+                    renderHourlyPlanner(hourlyTasks);
+                    return; // Stop here, separate rendering function handles this
+                case 'chart':
+                    title = 'Perkembangan Habit (30 Hari Terakhir)';
+                    document.getElementById('task-list-view').classList.add('hidden');
+                    renderProgressChart();
+                    return; // Stop here, separate rendering function handles this
+            }
+
+            document.getElementById('view-title').textContent = title;
+
+            if (filteredTasks.length === 0) {
+                container.innerHTML = `<p class="text-center py-8 text-gray-500 dark:text-gray-400">Tidak ada tugas/habit untuk tampilan ini.</p>`;
+                return;
+            }
+
+            const today = new Date().toISOString().split('T')[0];
+            let html = '';
+
+            filteredTasks.forEach(task => {
+                const isCompleted = task.type === 'task' ? task.isCompleted : !!task.completions[today];
+                const checkedClass = isCompleted ? 'bg-green-500 hover:bg-green-600' : 'bg-white border-gray-300 hover:bg-gray-100 dark:bg-gray-800 dark:border-gray-600';
+                const textClass = isCompleted ? 'line-through text-gray-400 dark:text-gray-500' : 'text-gray-900 dark:text-gray-100';
+
+                html += `
+                    <div class="flex items-center justify-between p-4 bg-white dark:bg-gray-800 rounded-lg shadow-sm mb-3 border border-gray-200 dark:border-gray-700">
+                        <div class="flex items-center flex-1 min-w-0">
+                            <button
+                                onclick="handleToggleCompletion('${task.id}', '${task.type}', ${isCompleted})"
+                                class="w-6 h-6 rounded-full border-2 flex items-center justify-center transition duration-200 ${checkedClass} focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-purple-500"
+                            >
+                                ${isCompleted ? '<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' : ''}
+                            </button>
+                            <div class="ml-4 truncate">
+                                <p class="text-lg font-medium ${textClass} truncate" title="${task.name}">${task.name}</p>
+                                <p class="text-sm text-indigo-500 dark:text-purple-400">${task.schedule ? `Pukul ${task.schedule} | ` : ''}Tipe: ${task.type === 'habit' ? 'Habit' : 'Tugas'}</p>
+                            </div>
+                        </div>
+                        <button
+                            onclick="handleOpenEditModal(${JSON.stringify(task).replace(/"/g, '&quot;')})"
+                            class="ml-4 text-indigo-600 dark:text-purple-400 hover:text-indigo-800 dark:hover:text-purple-300 p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                            title="Edit Tugas"
+                        >
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-7-9l5 5m-5-5l5 5"></path></svg>
+                        </button>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
+        }
+
+        function renderHourlyPlanner(tasks) {
+            document.getElementById('hourly-planner-container').classList.remove('hidden');
+            document.getElementById('view-title').textContent = 'Planning Time (Per Jam)';
+            const plannerBody = document.getElementById('hourly-planner-body');
+            plannerBody.innerHTML = '';
+
+            const hours = Array.from({ length: 24 }, (_, i) => i.toString().padStart(2, '0'));
+            const today = new Date().toISOString().split('T')[0];
+
+            hours.forEach(hour => {
+                const timeLabel = `${hour}:00`;
+                const taskAtHour = tasks.find(t => t.schedule === timeLabel);
+
+                let content = 'Kosong';
+                let contentClass = 'text-gray-500 dark:text-gray-400';
+                let actionButton = '';
+
+                if (taskAtHour) {
+                    const isCompleted = taskAtHour.type === 'task' ? taskAtHour.isCompleted : !!taskAtHour.completions[today];
+                    content = taskAtHour.name;
+                    contentClass = isCompleted ? 'line-through text-gray-400 dark:text-gray-500' : 'text-gray-900 dark:text-gray-100 font-medium';
+                    const checkedClass = isCompleted ? 'bg-green-500 hover:bg-green-600' : 'bg-white border-gray-300 hover:bg-gray-100 dark:bg-gray-800 dark:border-gray-600';
+
+                    actionButton = `
+                        <div class="flex items-center space-x-2">
+                            <button
+                                onclick="handleToggleCompletion('${taskAtHour.id}', '${taskAtHour.type}', ${isCompleted})"
+                                class="w-6 h-6 rounded-full border-2 flex items-center justify-center transition duration-200 ${checkedClass} focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-purple-500"
+                                title="Tandai Selesai"
+                            >
+                                ${isCompleted ? '<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>' : ''}
+                            </button>
+                            <button
+                                onclick="handleOpenEditModal(${JSON.stringify(taskAtHour).replace(/"/g, '&quot;')})"
+                                class="text-indigo-600 dark:text-purple-400 hover:text-indigo-800 dark:hover:text-purple-300 p-1 rounded-full hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                                title="Edit Tugas"
+                            >
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-7-9l5 5m-5-5l5 5"></path></svg>
+                            </button>
+                        </div>
+                    `;
+                }
+
+                plannerBody.innerHTML += `
+                    <div class="hour-slot py-3 border-b dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition duration-150">
+                        <div class="text-sm font-semibold text-indigo-600 dark:text-purple-400">${timeLabel}</div>
+                        <div class="flex justify-between items-center min-w-0">
+                            <span class="${contentClass} truncate">${content}</span>
+                            ${actionButton}
+                        </div>
+                    </div>
+                `;
+            });
+        }
+
+        // --- CHART & PROGRESS LOGIC ---
+        let monthlyChart = null;
+
+        function renderProgressChart() {
+            document.getElementById('progress-chart-container').classList.remove('hidden');
+            document.getElementById('view-title').textContent = 'Perkembangan Habit (30 Hari)';
+
+            const canvas = document.getElementById('monthly-progress-chart');
+            const dailyHabits = globalTasks.filter(t => t.type === 'habit' && t.frequency === 'daily');
+
+            if (dailyHabits.length === 0) {
+                 canvas.parentElement.innerHTML = `<p class="text-center py-8 text-gray-500 dark:text-gray-400">Tambahkan habit harian untuk melihat diagram perkembangan.</p>`;
+                return;
+            }
+
+            // Hitung data untuk 30 hari terakhir
+            const data30Days = calculate30DayProgress(dailyHabits);
+
+            // Jika chart sudah ada, hancurkan dulu
+            if (monthlyChart) {
+                monthlyChart.destroy();
+            }
+
+            // Konfigurasi Chart.js
+            const ctx = canvas.getContext('2d');
+            monthlyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data30Days.labels, // Tanggal
+                    datasets: [{
+                        label: 'Persentase Habit Selesai',
+                        data: data30Days.completionRates, // Tingkat penyelesaian
+                        borderColor: '#4f46e5', // Indigo-600
+                        backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 4,
+                        pointBackgroundColor: '#4f46e5',
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        title: {
+                            display: true,
+                            text: 'Tingkat Penyelesaian Harian (Rata-rata %)',
+                            color: document.body.classList.contains('dark') ? '#e2e8f0' : '#1a202c'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            max: 100,
+                            title: {
+                                display: true,
+                                text: 'Persentase (%)',
+                                color: document.body.classList.contains('dark') ? '#e2e8f0' : '#1a202c'
+                            },
+                            ticks: {
+                                color: document.body.classList.contains('dark') ? '#e2e8f0' : '#1a202c'
+                            }
+                        },
+                        x: {
+                            ticks: {
+                                color: document.body.classList.contains('dark') ? '#e2e8f0' : '#1a202c',
+                                autoSkip: true,
+                                maxTicksLimit: 10
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function calculate30DayProgress(dailyHabits) {
+            const days = [];
+            const completionRates = [];
+            const numHabits = dailyHabits.length;
+
+            if (numHabits === 0) return { labels: [], completionRates: [] };
+
+            // Buat daftar 30 hari terakhir (termasuk hari ini)
+            for (let i = 29; i >= 0; i--) {
+                const date = new Date();
+                date.setDate(date.getDate() - i);
+                const dateKey = date.toISOString().split('T')[0];
+                const label = date.toLocaleDateString('id-ID', { day: '2-digit', month: 'short' });
+
+                let completedCount = 0;
+                dailyHabits.forEach(habit => {
+                    if (habit.completions && habit.completions[dateKey]) {
+                        completedCount++;
+                    }
+                });
+
+                // Hitung persentase
+                const rate = (completedCount / numHabits) * 100;
+
+                days.push(label);
+                completionRates.push(Math.round(rate));
+            }
+
+            return { labels: days, completionRates };
+        }
+
+        // --- THEME LOGIC (Dark/Light Mode) ---
+
+        function initTheme() {
+            const themeToggle = document.getElementById('theme-toggle');
+            const savedTheme = localStorage.getItem('theme');
+
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+
+            themeToggle.addEventListener('click', toggleTheme);
+        }
+
+        function toggleTheme() {
+            if (document.documentElement.classList.contains('dark')) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+            // Update chart colors if it exists
+            if (monthlyChart) {
+                const isDark = document.body.classList.contains('dark');
+                monthlyChart.options.plugins.title.color = isDark ? '#e2e8f0' : '#1a202c';
+                monthlyChart.options.scales.y.title.color = isDark ? '#e2e8f0' : '#1a202c';
+                monthlyChart.options.scales.y.ticks.color = isDark ? '#e2e8f0' : '#1a202c';
+                monthlyChart.options.scales.x.ticks.color = isDark ? '#e2e8f0' : '#1a202c';
+                monthlyChart.update();
+            }
+        }
+
+    </script>
+</head>
+<body class="bg-gray-50 dark:bg-gray-900 transition duration-300 min-h-screen">
+
+    <div class="container mx-auto p-4 sm:p-6 lg:p-8 max-w-4xl">
+
+        <!-- HEADER & ID USER -->
+        <header class="flex justify-between items-center mb-6 p-4 bg-white dark:bg-gray-800 shadow-md rounded-xl">
+            <div class="flex flex-col">
+                <h1 class="text-3xl font-extrabold text-indigo-700 dark:text-purple-400">Life Planner</h1>
+                <p id="user-id-display" class="text-xs mt-1 text-gray-500 dark:text-gray-400 truncate">ID Pengguna: Menghubungkan...</p>
+            </div>
+            <button id="theme-toggle" class="p-2 rounded-full text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition" title="Toggle Dark/Light Mode">
+                <!-- Icon for Dark Mode -->
+                <svg id="sun-icon" class="w-6 h-6 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+                <!-- Icon for Light Mode -->
+                <svg id="moon-icon" class="w-6 h-6 dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+            </button>
+        </header>
+
+        <!-- NAVIGATION -->
+        <nav class="flex flex-wrap justify-center space-x-2 sm:space-x-4 p-3 mb-6 bg-white dark:bg-gray-800 rounded-xl shadow-md">
+            <button data-view="daily" class="nav-button bg-indigo-600 text-white dark:bg-purple-600 p-2 sm:p-3 rounded-lg text-sm font-semibold transition duration-200">Harian</button>
+            <button data-view="weekly" class="nav-button bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 p-2 sm:p-3 rounded-lg text-sm font-semibold transition duration-200">Mingguan</button>
+            <button data-view="monthly" class="nav-button bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 p-2 sm:p-3 rounded-lg text-sm font-semibold transition duration-200">Bulanan</button>
+            <button data-view="hourly" class="nav-button bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 p-2 sm:p-3 rounded-lg text-sm font-semibold transition duration-200">Time Block</button>
+            <button data-view="chart" class="nav-button bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 p-2 sm:p-3 rounded-lg text-sm font-semibold transition duration-200">Perkembangan</button>
+        </nav>
+
+        <!-- ADD TASK FORM -->
+        <section class="mb-8 p-6 bg-white dark:bg-gray-800 rounded-xl shadow-lg border border-indigo-100 dark:border-purple-900">
+            <h2 class="text-2xl font-bold mb-4 text-indigo-700 dark:text-purple-400">Tambah Tugas / Habit Baru</h2>
+            <form id="task-form" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label for="task-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Nama Tugas/Habit</label>
+                        <input type="text" id="task-name" required placeholder="Contoh: Baca buku 30 menit" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+                    <div>
+                        <label for="task-type" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Tipe</label>
+                        <select id="task-type" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                            <option value="habit">Habit (Kebiasaan berulang)</option>
+                            <option value="task">Tugas (Selesai sekali)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label for="task-frequency" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Frekuensi</label>
+                        <select id="task-frequency" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                            <option value="daily">Harian</option>
+                            <option value="weekly">Mingguan</option>
+                            <option value="monthly">Bulanan</option>
+                            <option value="one-time">Tugas Sekali Selesai</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="task-schedule" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Jadwal Per Jam (Opsional)</label>
+                        <input type="time" id="task-schedule" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+                </div>
+                <button type="submit" class="w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-lg font-medium text-white bg-indigo-600 hover:bg-indigo-700 dark:bg-purple-600 dark:hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 dark:focus:ring-purple-500 transition duration-150">
+                    Tambahkan
+                </button>
+            </form>
+        </section>
+
+        <!-- MAIN CONTENT VIEW -->
+        <main>
+            <h2 id="view-title" class="text-3xl font-bold mb-6 text-gray-900 dark:text-gray-100">Jadwal Harian & Habit</h2>
+
+            <!-- TASK LIST VIEW -->
+            <section id="task-list-view" class="space-y-4">
+                 <div id="task-list-container" class="scroll-container max-h-[60vh] overflow-y-auto pr-2">
+                    <!-- Tasks will be rendered here -->
+                    <p class="text-center py-8 text-gray-500 dark:text-gray-400">Memuat tugas...</p>
+                </div>
+            </section>
+
+            <!-- HOURLY PLANNER VIEW -->
+            <section id="hourly-planner-container" class="hidden bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                <p class="mb-4 text-gray-600 dark:text-gray-400">Jadwal ini menampilkan semua Tugas/Habit Harian yang memiliki waktu spesifik (Time Blocking).</p>
+                <div id="hourly-planner-body" class="divide-y divide-gray-100 dark:divide-gray-700">
+                    <!-- Hourly slots will be rendered here -->
+                </div>
+            </section>
+
+            <!-- PROGRESS CHART VIEW -->
+            <section id="progress-chart-container" class="hidden bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6">
+                 <div class="h-80 sm:h-96">
+                    <canvas id="monthly-progress-chart"></canvas>
+                </div>
+            </section>
+        </main>
+
+        <!-- EDIT/DELETE MODAL -->
+        <div id="edit-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md p-6">
+                <h3 class="text-2xl font-bold mb-4 text-indigo-700 dark:text-purple-400">Edit Tugas/Habit</h3>
+                <form id="edit-task-form" class="space-y-4">
+                    <input type="hidden" id="edit-task-id">
+                    <div>
+                        <label for="edit-task-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Nama Tugas/Habit</label>
+                        <input type="text" id="edit-task-name" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+                    <div>
+                        <label for="edit-task-type" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Tipe</label>
+                        <select id="edit-task-type" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                            <option value="habit">Habit (Kebiasaan berulang)</option>
+                            <option value="task">Tugas (Selesai sekali)</option>
+                        </select>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label for="edit-task-frequency" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Frekuensi</label>
+                            <select id="edit-task-frequency" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                                <option value="daily">Harian</option>
+                                <option value="weekly">Mingguan</option>
+                                <option value="monthly">Bulanan</option>
+                                <option value="one-time">Tugas Sekali Selesai</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="edit-task-schedule" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Jadwal Per Jam (Opsional)</label>
+                            <input type="time" id="edit-task-schedule" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 dark:text-white focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                    </div>
+                    <div class="flex justify-between space-x-3 pt-2">
+                        <button type="button" id="delete-task-btn" class="flex-1 py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 transition duration-150">
+                            Hapus
+                        </button>
+                        <button type="submit" class="flex-1 py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 dark:bg-purple-600 dark:hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150">
+                            Simpan Perubahan
+                        </button>
+                        <button type="button" onclick="handleCloseEditModal()" class="py-2 px-4 rounded-md shadow-sm text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500 transition duration-150">
+                            Batal
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
+
